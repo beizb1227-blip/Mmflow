@@ -1,5 +1,4 @@
-
-import os 
+import os
 import copy
 import math
 import os
@@ -23,6 +22,11 @@ from tqdm.auto import tqdm
 from utils.utils import set_random_seed
 from utils.normalization import unnormalize_min_max, unnormalize_sqrt
 
+from torch.backends.cuda import sdp_kernel
+
+from visualization import *
+from amd_amv_kde_metrics import metric
+from kde_loss import compute_kde_nll
 
 # helpers functions
 def exists(x):
@@ -188,7 +192,7 @@ class Trainer(object):
     def device(self):
         return self.cfg.device
 
-    def save_ckpt(self, ckpt_name):
+    def save_ckpt(self, ckpt_name):       # 保存checkpoint
         if not self.accelerator.is_local_main_process:
             return
         data = {
@@ -242,81 +246,84 @@ class Trainer(object):
         iter_per_epoch = self.train_num_steps // self.cfg.OPTIMIZATION.NUM_EPOCHS
 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
-            while self.step < self.train_num_steps:
-                # init per-iteration variables
-                total_loss = 0.
-                self.denoiser.train()
-                self.ema.ema_model.train()
+            with sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False):
+                while self.step < self.train_num_steps:
+                    # init per-iteration variables
+                    total_loss = 0.
+                    self.denoiser.train()
+                    self.ema.ema_model.train()
 
-                for _ in range(self.gradient_accumulate_every):
-                    data = {k : v.to(self.device) for k, v in next(self.dl).items()}
-                    
-                    log_dict = {'cur_epoch': self.step // iter_per_epoch}
+                    for _ in range(self.gradient_accumulate_every):
+                        data = {k : v.to(self.device) for k, v in next(self.dl).items()}
 
-                    if self.cfg.get('perturb_ctx', 0.0):
-                        # used in SDD dataset
-                        bs = data['past_traj'].shape[0]
-                        scale_ = torch.randn((bs), device=self.device) * self.cfg.perturb_ctx + 1
-                        data['past_traj_original_scale'] = data['past_traj_original_scale'] * scale_[:, None, None, None]
+                        log_dict = {'cur_epoch': self.step // iter_per_epoch}
+                        # 对过去轨迹添加扰动（仅在SDD数据集可能使用，用于数据增强）
+                        if self.cfg.get('perturb_ctx', 0.0):
+                            # used in SDD dataset
+                            bs = data['past_traj'].shape[0]
+                            scale_ = torch.randn((bs), device=self.device) * self.cfg.perturb_ctx + 1
+                            data['past_traj_original_scale'] = data['past_traj_original_scale'] * scale_[:, None, None, None]
 
-                    # compute the loss
-                    with self.accelerator.autocast():
-                        loss, loss_reg, loss_cls, loss_vel = self.denoiser(data, log_dict)
-                        loss = loss / self.gradient_accumulate_every
-                        total_loss += loss.item()
+                        # compute the loss
+                        with self.accelerator.autocast():
+                            loss, loss_reg, loss_cls, loss_vel = self.denoiser(data, log_dict)     #自动调用flowmatching里的forward方法
+                            loss = loss / self.gradient_accumulate_every
+                            total_loss += loss.item()
 
-                    self.accelerator.backward(loss)
+                        self.accelerator.backward(loss)
 
-                    # log to tensorboard
-                    if self.tb_log is not None:
-                        self.tb_log.add_scalar('train/loss_total', loss.item(), self.step)
-                        self.tb_log.add_scalar('train/loss_reg', loss_reg.item(), self.step)
-                        self.tb_log.add_scalar('train/loss_cls', loss_cls.item(), self.step)
-                        self.tb_log.add_scalar('train/loss_vel', loss_vel.item(), self.step)
-                        self.tb_log.add_scalar('train/learning_rate', self.opt.param_groups[0]["lr"], self.step)
+                        # log to tensorboard
+                        if self.tb_log is not None:
+                            self.tb_log.add_scalar('train/loss_total', loss.item(), self.step)
+                            self.tb_log.add_scalar('train/loss_reg', loss_reg.item(), self.step)
+                            self.tb_log.add_scalar('train/loss_cls', loss_cls.item(), self.step)
+                            self.tb_log.add_scalar('train/loss_vel', loss_vel.item(), self.step)
+                            self.tb_log.add_scalar('train/learning_rate', self.opt.param_groups[0]["lr"], self.step)
 
-                       
-                    
-                pbar.set_description(f'total loss: {total_loss:.4f}, loss_reg: {loss_reg:.4f}, loss_cls: {loss_cls:.4f}, loss_vel: {loss_vel:.4f}, lr: {self.opt.param_groups[0]["lr"]:.6f}')
 
-                accelerator.wait_for_everyone()
-                accelerator.clip_grad_norm_(self.denoiser.parameters(), self.cfg.OPTIMIZATION.GRAD_NORM_CLIP)
 
-                self.opt.step()
-                self.opt.zero_grad()
+                    pbar.set_description(f'total loss: {total_loss:.4f}, loss_reg: {loss_reg:.4f}, loss_cls: {loss_cls:.4f}, loss_vel: {loss_vel:.4f}, lr: {self.opt.param_groups[0]["lr"]:.6f}')
 
-                accelerator.wait_for_everyone()
+                    accelerator.wait_for_everyone() #同步进程
+                    # 梯度裁剪（防止梯度爆炸）
+                    accelerator.clip_grad_norm_(self.denoiser.parameters(), self.cfg.OPTIMIZATION.GRAD_NORM_CLIP)
 
-                if accelerator.is_main_process:
-                    self.ema.update()
-                    # checkpt test and save the best validation model
-                    if (self.step + 1) >= self.save_and_sample_every and (self.step + 1) % self.save_and_sample_every == 0:
-                        fut_traj_gt, performance, n_samples = self.eval_dataloader(testing_mode=False, training_err_check=False)
+                    self.opt.step()
+                    self.opt.zero_grad()
 
-                        # update the best model
-                        if performance['ADE_min'][3] < self.best_ade_min:
-                            self.best_ade_min = performance['ADE_min'][3]
-                            self.logger.info(f'Current best ADE_MIN: {self.best_ade_min/n_samples}')
-                            self.save_ckpt('checkpoint_best')
+                    accelerator.wait_for_everyone()
 
-                        # save the model and remove the old models
-                        cur_epoch = self.step // iter_per_epoch
+                    if accelerator.is_main_process:
+                        self.ema.update()  # 更新EMA模型参数（指数移动平均，提高泛化性）
+                        # checkpt test and save the best validation model
+                        if (self.step + 1) >= self.save_and_sample_every and (self.step + 1) % self.save_and_sample_every == 0:
+                            # 在验证集上评估性能
+                            fut_traj_gt, performance, n_samples = self.eval_dataloader(testing_mode=False, training_err_check=False)
 
-                        ckpt_list = glob(os.path.join(self.cfg.model_dir, 'checkpoint_epoch_*.pt*'))
-                        ckpt_list.sort(key=os.path.getmtime)
+                            # update the best model 更新最佳模型（根据ADE_min指标
+                            if performance['ADE_min'][3] < self.best_ade_min:
+                                self.best_ade_min = performance['ADE_min'][3]
+                                self.logger.info(f'Current best ADE_MIN: {self.best_ade_min/n_samples}')
+                                self.save_ckpt('checkpoint_best')
 
-                        if ckpt_list.__len__() >= self.cfg.max_num_ckpts:
-                            for cur_file_idx in range(0, len(ckpt_list) - self.cfg.max_num_ckpts + 1):
-                                os.remove(ckpt_list[cur_file_idx])
+                            # save the model and remove the old models
+                            cur_epoch = self.step // iter_per_epoch
+                            # 查找并删除旧检查点（保持最多max_num_ckpts个）
+                            ckpt_list = glob(os.path.join(self.cfg.model_dir, 'checkpoint_epoch_*.pt*'))
+                            ckpt_list.sort(key=os.path.getmtime)
 
-                        self.save_ckpt('checkpoint_epoch_%d' % cur_epoch)
+                            if ckpt_list.__len__() >= self.cfg.max_num_ckpts:
+                                for cur_file_idx in range(0, len(ckpt_list) - self.cfg.max_num_ckpts + 1):
+                                    os.remove(ckpt_list[cur_file_idx])
 
-                self.step += 1
-                pbar.update(1)
-                self.scheduler.step() 
+                            self.save_ckpt('checkpoint_epoch_%d' % cur_epoch)
 
-                # end of one training iteration
-            # end of training loop
+                    self.step += 1
+                    pbar.update(1)
+                    self.scheduler.step()   # 更新学习率
+
+                    # end of one training iteration
+                # end of training loop
 
         self.save_last_ckpt()
 
@@ -337,7 +344,7 @@ class Trainer(object):
     
     ### TODO: add the eval of JADE/JFDE
     ### Based on https://arxiv.org/abs/2305.06292 Joint metric for ADE and FDE
-    def compute_JADE_JFDE(self, distances, end_frame):
+    def compute_JADE_JFDE(self, distances, end_frame):  # 联合ADE FDE
         '''
         Helper function to compute JADE and JFDE
         distances: [b*num_agents, k_preds, future_frames] or [b*num_agents, timestamps, k_preds, future_frames]
@@ -352,6 +359,7 @@ class Trainer(object):
 
     def compute_avar_fvar(self, pred_trajs, end_frame):
         '''
+        预测方差指标（AVar和FVar）
         Helper function to compute AVar and FVar
         predictions: [b*num_agents,k_preds, future_frames, dim]
         ade_frames: int
@@ -361,8 +369,10 @@ class Trainer(object):
         f_var = pred_trajs[..., end_frame-1,:].var(dim=(1,2)).sum()
         return a_var, f_var
 
+
     def compute_MASD(self, pred_trajs, end_frame):
         '''
+        最大平均样本距离（评估预测多样性）
         Helper function to compute MASD
         predictions: [b*num_agents,k_preds, future_frames, dim]
         ade_frames: int
@@ -389,6 +399,7 @@ class Trainer(object):
 
         set_random_seed(42)
 
+        # 加载指定checkpoint（last或best）
         if mode == 'last':
             ckpt_states = torch.load(os.path.join(self.cfg.model_dir, 'checkpoint_last.pt'), map_location=self.device, weights_only=True)
         else:
@@ -409,16 +420,18 @@ class Trainer(object):
 
     def sample_from_denoising_model(self, data):
         """
-        Return the samples from denoising model in normal scale
+        Return the samples from denoising model in normal scale 从去噪模型采样，返回正常尺度的预测轨迹
         """
 
         # [B, K, A, T*F], [B, S, K, A, T*F], [B, S, K, A, T*F], [B, K, A]
         pred_traj, pred_traj_at_t, t_seq, y_t_seq, pred_score = self.denoiser.sample(data, num_trajs=self.cfg.denoising_head_preds, return_all_states=self.save_samples)
+        # 你的配置中：A=2，MODEL_OUT_DIM=24 → 即验证后两维是否为 [2, 24]
         assert list(pred_traj.shape[2:]) == [self.cfg.agents, self.cfg.MODEL.MODEL_OUT_DIM]
 
         pred_traj = rearrange(pred_traj, 'b k a (f d) -> (b a) k f d', f=self.cfg.future_frames)[...,0:2]  # [B, k_preds, 11, 40] -> [B * 11, k_preds, 20, 2]
         pred_traj_at_t = rearrange(pred_traj_at_t, 'b t k a (f d) -> (b a) t k f d', f=self.cfg.future_frames)[...,0:2]  # [B, k_preds, 11, 40] -> [B * 11, k_preds, 20, 2]
 
+        # 5. 根据配置的归一化方式，反归一化预测轨迹到真实物理尺度
         if self.cfg.get('data_norm', None) == 'min_max':
             pred_traj = unnormalize_min_max(pred_traj, self.cfg.fut_traj_min, self.cfg.fut_traj_max, -1, 1) 
             pred_traj_at_t = unnormalize_min_max(pred_traj_at_t, self.cfg.fut_traj_min, self.cfg.fut_traj_max, -1, 1)
@@ -431,6 +444,7 @@ class Trainer(object):
             raise NotImplementedError(f'Data normalization [{self.cfg.data_norm}] is not implemented yet.')
 
         return pred_traj, pred_traj_at_t, t_seq, y_t_seq, pred_score
+    # pred_score: 每个候选轨迹的置信度
     
 
     def save_latent_states(self, t_seq_ls, y_t_seq_ls, y_pred_data_ls, x_data_ls, pred_score_ls, file_name):
@@ -508,10 +522,27 @@ class Trainer(object):
         General API to evaluate the dataloader/dataset
         """
         ### turn on the eval mode
-        self.denoiser.eval()   
+        self.denoiser.eval()
         self.ema.ema_model.eval()
         self.logger.info(f'Record the statistics of samples from the denoising model')
 
+        ###########
+        all_data = pickle.load(open('data/eth_ucy/original/zara2/zara2_test.pkl', 'rb'))
+        list_scene = all_data['seq_start_end']
+        # 初始化存储变量
+        interval_data = []
+        current_interval = None
+        past_traj_list = []
+        fut_traj_gt_list = []
+        pred_traj_list = []
+        initial_pos_list = []
+        count = 0  # 用于计数
+
+        mabs_loss = []
+        kde_loss = []
+        eig_collect = []
+
+        # 选择评估数据集（验证 / 测试 / 训练集）
         if testing_mode:
             self.logger.info(f'Start recording test set ADE/FDE...')
             status = 'test'
@@ -519,51 +550,186 @@ class Trainer(object):
         elif training_err_check:
             self.logger.info(f'Start recording training set ADE/FDE...')
             status = 'train'
-            dl = self.train_loader
+            dl = self.test_loader
         else:
             self.logger.info(f'Start recording validation set ADE/FDE...')
             status = 'val'
             dl = self.val_loader
-      
+
         ### setup the performance dict
+        ### 2. 初始化性能字典（存储关键指标，4个时间点的结果）
         performance = {'FDE_min': [0,0,0,0], 'ADE_min': [0,0,0,0], 'FDE_avg': [0,0,0,0], 'ADE_avg': [0,0,0,0], 'A_var': [0,0,0,0], 'F_var': [0,0,0,0], 'MASD': [0,0,0,0]}
+        # 联合指标：JFDE/JADE（考虑多智能体协同的联合误差，对应论文3.E节）
         performance_joint = {'JFDE_min': [0,0,0,0], 'JADE_min': [0,0,0,0], 'JFDE_avg': [0,0,0,0], 'JADE_avg': [0,0,0,0]}
         num_trajs = 0
         t_seq_ls, y_t_seq_ls, y_pred_data_ls, x_data_ls = [], [], [], []
-        ### record running time
+        ### record running time  记录GPU运行时间（评估模型实时性）
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        for i_batch, data in enumerate(dl): 
-            bs = int(data['batch_size'])
+        for i_batch, data in enumerate(dl):
+            bs = int(data['batch_size']) # p次大小（如测试集 bs=1024，来自配置文件）
             data = {k : v.to(self.device) for k, v in data.items()}
 
+            #  1. 生成预测轨迹（调用采样函数，核心是Flow Matching的一步生成）
             pred_traj, pred_traj_t, t_seq, y_t_seq, pred_score = self.sample_from_denoising_model(data)
-
+            '''pred_traj：最终预测轨迹 → [B*A, K, T, D]（批次×智能体×候选×时间步×坐标）
+            # pred_traj_t：不同去噪时间步的预测 → [B*A, S, K, T, D]（S=采样步数，如10）
+            # t_seq：去噪时间步序列 → [S]
+            # y_t_seq：去噪过程中的带噪轨迹 → [B, S, K, A, T*D]
+            # pred_score：候选轨迹的置信度 → [B, K, A]'''
+            # 2. 调整真实轨迹维度（与预测轨迹匹配，用于计算误差）
             fut_traj = rearrange(data['fut_traj_original_scale'], 'b a f d -> (b a) f d')               # [B, A, T, F] -> [B * A, T, F]
             fut_traj_gt = fut_traj.unsqueeze(1).repeat(1, self.cfg.denoising_head_preds, 1, 1)          # [B * A, K, T, F]
+            # 3. 计算预测与真实轨迹的L2距离（欧氏距离）
+            # distances：[B*A, K, T] → 每个智能体、每个候选、每个时间步的误差
             distances = (fut_traj_gt - pred_traj).norm(p=2, dim=-1)                                     # [B * A, K, T]
-
             distances_t = (pred_traj_t - fut_traj_gt.unsqueeze(1)).norm(p=2, dim=-1)                    # [B * A, S, K, T]
-            
-            ade_fde_ = self.compute_ADE_FDE(distances_t, self.cfg.future_frames)                        # 4 * [S], denoising steps
-           
+
+            # _kde, m, eig = metric(fut_traj, pred_traj)
+            # mabs_loss.append(m)  # m   amd
+            # eig_collect.append(eig)  # amv
+            # # _kde = compute_kde_nll(pred_traj, fut_traj)
+            # kde_loss.append(_kde)  # kde
+
+            ##############################场景可视化##############################
+            # initial_pos = data['initial_pos'] ##
+            # past_traj = data['past_traj_original_scale'].squeeze(1)
+            # # 检查当前批次是否属于某个区间的起始位置
+            # if current_interval is None:
+            #     # 查找当前批次所属的区间
+            #     for interval in list_scene:
+            #         start, end = interval
+            #         if start <= i_batch < end:
+            #             current_interval = interval
+            #             past_traj_list = []
+            #             fut_traj_gt_list = []
+            #             pred_traj_list = []
+            #             initial_pos_list = []
+            #             break
+            #
+            # # 如果当前批次属于某个区间，则累积数据
+            # if current_interval is not None:
+            #     start, end = current_interval
+            #     past_traj_list.append(past_traj)
+            #     fut_traj_gt_list.append(fut_traj_gt)
+            #     pred_traj_list.append(pred_traj)
+            #     initial_pos_list.append(initial_pos)
+            #
+            #     # 检查是否到达区间的结束位置
+            #     if i_batch >= end - 1:  # 因为区间是左闭右开的
+            #         # 拼接张量
+            #         past_traj_concat = torch.cat(past_traj_list, dim=0)
+            #         fut_traj_gt_concat = torch.cat(fut_traj_gt_list, dim=0)
+            #         pred_traj_concat = torch.cat(pred_traj_list, dim=0)
+            #         initial_pos_concat = torch.cat(initial_pos_list, dim=0)
+            #
+            #         # 存储结果
+            #         interval_data.append({
+            #             'interval': current_interval,
+            #             'past_traj': past_traj_concat,
+            #             'fut_traj_gt': fut_traj_gt_concat,
+            #             'pred_traj': pred_traj_concat,
+            #             'initial_pos': initial_pos_concat,
+            #         })
+            #
+            #         # 打印计数
+            #         count += 1
+            #         past_traj_concat = past_traj_concat[:, :, 2:4]
+            #         past_traj_concat = past_traj_concat + initial_pos_concat.squeeze(1)
+            #         initial_pos_concat = initial_pos_concat.repeat(1,20,1,1)
+            #         fut_traj_gt_concat = fut_traj_gt_concat + initial_pos_concat
+            #         pred_traj_concat = pred_traj_concat + initial_pos_concat
+            #         draw_best(past_traj_concat, fut_traj_gt_concat, pred_traj_concat, 1, count)
+            #         print(f"Interval {count}: {current_interval} processed")
+            #
+            #         # 重置当前区间
+            #         current_interval = None
+            ###############################场景可视化#############################
+
+            ###############################多模态轨迹可视化可视化#############################预测20条
+           # draw_more(data['past_traj_original_scale'].squeeze(1), fut_traj_gt, pred_traj, 1, i_batch)
+            ###############################多模态轨迹可视化可视化#############################
+
+            #### 可视化 ## 20条一起绘制
+            # def draw_more(past_traj, fut_traj, tra_pred, traj_scale, count):
+            #     past_traj = past_traj[:, :, 2:4]
+            #     print(f"past_traj:{past_traj.shape}\nfut_traj:{fut_traj.shape}\nx_t:{tra_pred.shape}")
+            #     num = fut_traj.size(0)
+            #     for j in range(num):  # epoch
+            #         # print(f"i:{j}")
+            #         # 提取每个张量第一维的数据用于可视化
+            #         past_traj_1st = past_traj[j].cpu().numpy() * traj_scale
+            #         fut_traj_1st = fut_traj[j].cpu().numpy() * traj_scale
+            #         x_t_1st = tra_pred[j].cpu().numpy() * traj_scale
+            #         # 设置不同的颜色用于区分不同的张量轨迹
+            #         past_color = 'g'  # 绿色表示past_traj
+            #         fut_color = 'b'  # 蓝色表示fut_traj
+            #         x_t_color = 'r'  # 红色表示x_t
+            #
+            #         # 创建新的图像和坐标轴对象
+            #         fig, ax = plt.subplots()
+            #
+            #         # 绘制past_traj的轨迹
+            #         ax.plot(past_traj_1st[:, -2], past_traj_1st[:, -1], color=past_color)
+            #
+            #         # 标记过去轨迹的终点
+            #         x_end_past, y_end_past = past_traj_1st[-1, -2], past_traj_1st[-1, -1]
+            #         ax.plot(x_end_past, y_end_past, color=past_color, marker='*', markersize=8)
+            #
+            #         # 循环绘制每个索引对应的fut_traj和x_t的轨迹图
+            #         for i in range(fut_traj_1st.shape[0]):
+            #             # 绘制当前索引下fut_traj的轨迹，并标记终点
+            #             x_end_fut, y_end_fut = fut_traj_1st[i, -1, -2], fut_traj_1st[i, -1, -1]
+            #             ax.plot(x_end_fut, y_end_fut, color=fut_color, marker='*', markersize=8)
+            #             ax.plot(fut_traj_1st[i, :, -2], fut_traj_1st[i, :, -1], color=fut_color)
+            #
+            #             # 绘制当前索引下x_t的轨迹，并标记终点
+            #             x_end_xt, y_end_xt = x_t_1st[i, -1, -2], x_t_1st[i, -1, -1]
+            #             ax.plot(x_end_xt, y_end_xt, color=x_t_color, marker='*', markersize=8)
+            #             ax.plot(x_t_1st[i, :, -2], x_t_1st[i, :, -1], color=x_t_color)
+            #
+            #             # 用蓝色线条连接观测轨迹的终点和未来轨迹的起点
+            #             fut_start_x, fut_start_y = fut_traj_1st[i, 0, -2], fut_traj_1st[i, 0, -1]
+            #             ax.plot([x_end_past, fut_start_x], [y_end_past, fut_start_y], color='b',
+            #                     linestyle='--')
+            #
+            #             # 用红色线条连接观测轨迹的终点和预测轨迹的起点
+            #             xt_start_x, xt_start_y = x_t_1st[i, 0, -2], x_t_1st[i, 0, -1]
+            #             ax.plot([x_end_past, xt_start_x], [y_end_past, xt_start_y], color='r',
+            #                     linestyle='--')
+            #
+            #         # 移除标题、标签和图例设置
+            #         # ax.set_title(f'Trajectory Visualization - Index {j}')
+            #         # ax.set_xlabel('X Coordinate')
+            #         # ax.set_ylabel('Y Coordinate')
+            #         # ax.legend()
+            #
+            #         # 保存当前图像
+            #         plt.savefig(f'results_eth_ucy/cor_fm/5-18-zara2/img20/trajectory_{count}_{j}.png')
+            #         plt.close()
+
+
+            ade_fde_ = self.compute_ADE_FDE(distances_t, self.cfg.future_frames)      # 4 * [S], denoising steps
+
 
             if self.cfg.dataset == 'nba':
-                freq = 5 
+                freq = 5
                 factor_time = 1
             elif self.cfg.dataset == 'eth_ucy':
-                freq = 3
-                factor_time = 1.2
+                freq = 3         # 3帧 → 1.2s（2.5fps） 1帧0.4秒数
+                factor_time = 1.2  # 时间换算系数（帧→秒）
             elif self.cfg.dataset == 'sdd':
                 freq = 3
                 factor_time = 1.2
-                
+
+            ### 3. 遍历4个时间点（1.2s、2.4s、3.6s、4.8s），计算并累积指标
             for time in range(1, 5):
                 ade, fde, ade_avg, fde_avg = self.compute_ADE_FDE(distances, int(time * freq))
-                jade, jfde, jade_avg, jfde_avg = self.compute_JADE_JFDE(distances, int(time * freq)) 
+                jade, jfde, jade_avg, jfde_avg = self.compute_JADE_JFDE(distances, int(time * freq))
                 a_var, f_var = self.compute_avar_fvar(pred_traj, int(time * freq))
                 masd = self.compute_MASD(pred_traj, int(time * freq))
+
                 performance_joint['JADE_min'][time - 1] += jade.item()
                 performance_joint['JFDE_min'][time - 1] += jfde.item()
                 performance_joint['JADE_avg'][time - 1] += jade_avg.item()
@@ -576,19 +742,21 @@ class Trainer(object):
                 performance['F_var'][time - 1] += f_var.item()
                 performance['MASD'][time - 1] += masd.item()
 
+            ### 4. 断言：确保时间点覆盖所有未来帧（避免配置错误）
             assert freq * 4 == self.cfg.future_frames, 'Freq {} and number of frames {} do not match'.format(freq, self.cfg.future_frames)
-             
+            ### 5. 累积总轨迹数（用于后续计算平均指标）
             num_trajs += fut_traj.shape[0]
 
-            # save the denoising samples
+            # save the denoising samples 当save_samples=True时，保存去噪过程中的样本（用于后续分析）
             if self.save_samples:
+                # 仅保存最后5个去噪时间步（减少存储开销）
                 cutoff_timesteps = 5  # only save the last 5 timesteps sampling latents to reduce the storage size
 
                 y_t_seq = y_t_seq[:, -cutoff_timesteps:]
                 y_t_seq = rearrange(y_t_seq, 'b s k a (f d) -> b s k a f d', f=self.cfg.future_frames)
 
                 pred_traj = rearrange(pred_traj, '(b a) k f d -> b k a f d', b=bs)  # [B, K, A, T, F]
-            
+
                 num_datapoints = len(y_t_seq)
 
                 t_seq_ls = [t_seq]
@@ -600,16 +768,20 @@ class Trainer(object):
                 solver_tag = self.cfg.get('solver_tag', '')
                 save_name = f'denoising_samples_{status}_batch_{i_batch}_{num_datapoints}_{solver_tag}'
                 self.save_latent_states(t_seq_ls, y_t_seq_ls, y_pred_data_ls, x_data_ls, pred_score_ls, save_name)
-                
+
                 t_seq_ls, y_t_seq_ls, y_pred_data_ls, x_data_ls, pred_score_ls = [], [], [], [], []
-                
-        end.record()
+
+        # print("kde:", sum(kde_loss) / len(kde_loss), "amd:", sum(mabs_loss) / len(mabs_loss), "amv:", sum(eig_collect) / len(eig_collect))
+        # print("kde:", sum(kde_loss) / len(kde_loss))
+
+        end.record() # 结束计时并计算运行时间
         torch.cuda.synchronize()
-        self.logger.info(f'Total runtime: {start.elapsed_time(end):5f} ms')
-        self.logger.info(f'Runtime per scene: {start.elapsed_time(end)/len(dl.dataset):5f} ms')
-        self.logger.info(f'Number of scenes: {dl.dataset}')
+        self.logger.info(f'Total runtime: {start.elapsed_time(end):5f} ms')   # 总时间（ms）
+        self.logger.info(f'Runtime per scene: {start.elapsed_time(end)/len(dl.dataset):5f} ms')  # 单场景时间
+        self.logger.info(f'Number of scenes: {dl.dataset}')  # 总场景数
         cur_epoch = self.step // (self.train_num_steps // self.cfg.OPTIMIZATION.NUM_EPOCHS)
-        if not testing_mode: 
+        # 验证集评估：将指标写入TensorBoard（用于可视化训练过程）
+        if not testing_mode:
             self.logger.info(f'{self.step}/{self.train_num_steps}, running inference on {num_trajs} agents (trajectories)')
             for time in range(4):
                 if self.tb_log:
@@ -622,12 +794,12 @@ class Trainer(object):
                     self.tb_log.add_scalar(f'eval_{status}/JADE_avg_{time+1}s', performance_joint['JADE_avg'][time]/num_trajs, cur_epoch)
                     self.tb_log.add_scalar(f'eval_{status}/JFDE_avg_{time+1}s', performance_joint['JFDE_avg'][time]/num_trajs, cur_epoch)
 
-        # print out the performance
+        # print out the performance### 3. 输出所有评估指标（日志打印
         for time in range(4):
             self.logger.info('--ADE_min({:.1f}s): {:.7f}\t--FDE_min({:.1f}s): {:.7f}'.format(
                 (time+1)*factor_time, performance['ADE_min'][time]/num_trajs, time+1, performance['FDE_min'][time]/num_trajs))
 
-      
+
         for time in range(4):
             self.logger.info('--ADE_avg({:.1f}s): {:.7f}\t--FDE_avg({:.1f}s): {:.7f}'.format(
                 time+1, performance['ADE_avg'][time]/num_trajs, time+1, performance['FDE_avg'][time]/num_trajs))
@@ -635,22 +807,22 @@ class Trainer(object):
         for time in range(4):
             self.logger.info('--AVar({:.1f}s): {:.7f}\t--FVar({:.1f}s): {:.7f}'.format(
                 time+1, performance['A_var'][time]/num_trajs, time+1, performance['F_var'][time]/num_trajs))
-        
+
         for time in range(4):
             self.logger.info('--MASD({:.1f}s): {:.7f}'.format(
                 time+1, performance['MASD'][time]/num_trajs))
-            
+
         # print out the joint performance
         for time in range(4):
             self.logger.info('--JADE_min({:.1f}s): {:.7f}\t--JFDE_min({:.1f}s): {:.7f}'.format(
                 time+1, performance_joint['JADE_min'][time]/num_trajs, time+1, performance_joint['JFDE_min'][time]/num_trajs))
-        
+
         for time in range(4):
             self.logger.info('--JADE_avg({:.1f}s): {:.7f}\t--JFDE_avg({:.1f}s): {:.7f}'.format(
                 time+1, performance_joint['JADE_avg'][time]/num_trajs, time+1, performance_joint['JFDE_avg'][time]/num_trajs))
 
-        
-       
+
+
         return fut_traj_gt, performance, num_trajs
 
 

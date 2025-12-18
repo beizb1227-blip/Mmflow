@@ -17,10 +17,10 @@ from torch.nn.utils.rnn import pad_sequence
 
 def rotate_traj(past_rel, future_rel, past_abs, rotate_time_frame=0):
     """
-    @params past_rel: [N, A, P, 2]
-    @params future_rel: [N, A, F, 2]
-    @params past_abs: [N, A, P, 2]
-    @params rotate_time_frame: int
+    @params past_rel: [N, A, P, 2]    过去轨迹的相对坐标（N:样本数, A:智能体数, P:过去帧数）
+    @params future_rel: [N, A, F, 2]  未来轨迹的相对坐标（F:未来帧数）
+    @params past_abs: [N, A, P, 2]    过去轨迹的绝对坐标
+    @params rotate_time_frame: int    用于计算旋转角度的时间步索引
     """
 
     A = past_rel.size(1)
@@ -123,8 +123,8 @@ class SDDDataset(Dataset):
         self.rotate_time_frame = rotate_time_frame
         self.imle = imle
 
-        self.past_frames = cfg.past_frames
-        self.future_frames = cfg.future_frames
+        self.past_frames = cfg.past_frames            #过去8帧
+        self.future_frames = cfg.future_frames          #未来12帧率
         self.seq_len = self.past_frames + self.future_frames
         self.max_agents_per_scene = 0
         assert self.seq_len == 20 and self.past_frames == 8, "Sanity check on frame length failed!"
@@ -139,23 +139,23 @@ class SDDDataset(Dataset):
         ### set the agent_num in the cfg
         cfg.MODEL.CONTEXT_ENCODER.AGENTS = cfg.agents
         
-        ### compute past and future trajectories
-        past_traj_abs = torch.from_numpy(np.stack([scene[0] for scene in all_data], axis=0)).unsqueeze(1)    # [N, 1, T, 2]
+        ### compute past and future trajectories                                                             #unsqueeze 在位置1插入一个维度
+        past_traj_abs = torch.from_numpy(np.stack([scene[0] for scene in all_data], axis=0)).unsqueeze(1)    # [N, 1, T, 2]  提取过去轨迹的绝对坐标
 
         ### Compare with NSP model
         # past_traj_abs = torch.from_numpy(all_data[:,:self.past_frames])[...,:2].unsqueeze(1).float()    # [N, 1, T, 2]
         ### Compare with NSP model
 
-        initial_pos = past_traj_abs[:, :, -1:, :]                                                            # [N, 1, 1, 2]
-        past_traj_rel = (past_traj_abs - initial_pos).contiguous()                                           # [N, 1, T, 2]
+        initial_pos = past_traj_abs[:, :, -1:, :]             #计算参考点  #[N,1,1,2] 取过去轨迹的最后一帧作为参考点（比如第 8 帧）
+        past_traj_rel = (past_traj_abs - initial_pos).contiguous()                # [N, 1, T, 2]  过去轨迹相对坐标
 
-        fut_traj_abs = torch.from_numpy(np.stack([scene[1] for scene in all_data], axis=0)).unsqueeze(1)     # [N, 1, T, 2]
+        fut_traj_abs = torch.from_numpy(np.stack([scene[1] for scene in all_data], axis=0)).unsqueeze(1)     # [N, 1, F, 2]  提取未来轨迹的绝对坐标
 
         ### Compare with NSP model
         # fut_traj_abs = torch.from_numpy(all_data[:,self.past_frames:])[...,:2].unsqueeze(1).float()     # [N, 1, T, 2]
         ### Compare with NSP model 
 
-        fut_traj_rel = (fut_traj_abs - initial_pos).contiguous()                                             # [N, 1, T, 2]
+        fut_traj_rel = (fut_traj_abs - initial_pos).contiguous()                                             # [N, 1, T, 2] 未来轨迹相对坐标
 
         if cfg.rotate:
             past_traj_rel, fut_traj_rel, past_traj_abs = rotate_traj(past_traj_rel, fut_traj_rel, past_traj_abs, rotate_time_frame)

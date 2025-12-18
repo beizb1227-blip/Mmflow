@@ -40,7 +40,13 @@ class ETHMotionTransformer(nn.Module):
             sinu_pos_emb,
             nn.Linear(self.dim, time_dim),
             nn.ReLU(),
-            nn.Linear(time_dim, time_dim),
+            nn.Linear(time_dim, time_dim // 2),
+        )
+        self.r_mlp = nn.Sequential(
+            sinu_pos_emb,
+            nn.Linear(self.dim, time_dim),
+            nn.ReLU(),
+            nn.Linear(time_dim, time_dim // 2),
         )
 
         self.noisy_y_mlp = nn.Sequential(
@@ -58,6 +64,7 @@ class ETHMotionTransformer(nn.Module):
         dim_decoder = self.model_cfg.MOTION_DECODER.D_MODEL
         self.init_emb_fusion_mlp = nn.Sequential(
             nn.Linear(self.dim + time_dim + self.dim, self.dim),
+            #nn.Linear(time_dim + self.dim, self.dim),
             nn.LayerNorm(self.dim),
             nn.ReLU(),
             nn.Linear(self.dim, dim_decoder),
@@ -81,7 +88,7 @@ class ETHMotionTransformer(nn.Module):
         params_other = params_total - params_encoder - params_decoder
         logger.info("Total parameters: {:,}, Encoder: {:,}, Decoder: {:,}, Other: {:,}".format(params_total, params_encoder, params_decoder, params_other))
 
-    def forward(self, y, time, x_data):
+    def forward(self, y, time, r, x_data):
         """
         y: noisy vector
         time: denoising time step
@@ -93,7 +100,7 @@ class ETHMotionTransformer(nn.Module):
         device = y.device
         B, K, A, _ = y.shape
 
-        ### context encoder
+        ### context encoder 上下文
         encoder_out = self.context_encoder(x_data['past_traj_original_scale'])  # [B, A, D]
         encoder_out_batch = repeat(encoder_out, 'b a d -> b k a d', k=K, a=A) 	# [B, K, A, D]
 
@@ -102,28 +109,37 @@ class ETHMotionTransformer(nn.Module):
         y_emb = self.noisy_y_mlp(y)  	# [B, K, A, D]
 
         time_ = time
+        r_ = r
         if self.config.denoising_method == 'fm':
             time = time * 1000.0  # flow matching time upscaling
+            r = r * 1000.0
+        # 时间编码
+        t_emb = self.time_mlp(time) 	# [B, D] # (B,1)->(B,64)
 
-        t_emb = self.time_mlp(time) 	# [B, D]
-        t_emb_batch = repeat(t_emb, 'b d -> b k a d', b=B, k=K, a=A) # [B, K, A, D]
+        t_emb_batch = repeat(t_emb, 'b d -> b k a d', b=B, k=K, a=A) # [B, K, A, D] batch size , K = 20 , agent = 1 /2 /3 ,dim
+        r_emb = self.r_mlp(r) 	# [B, D]
+        r_emb_batch = repeat(r_emb, 'b d -> b k a d', b=B, k=K, a=A) # [B, K, A, D]
+        t_emb = torch.cat((t_emb, r_emb), dim=-1)
+        t_emb_batch = torch.cat((t_emb_batch, r_emb_batch), dim=-1)
 
+        # 1. 预测候选（K）的位置嵌入(区分不同候选轨迹)：区分不同的预测候选（如“第1个候选”和“第2个候选”）
         k_pe = self.motion_query_embedding(torch.arange(K, device=device))	# [K, D]
         k_pe_batch = repeat(k_pe, 'k d -> b k a d', b=B, a=A)	# [B, K, A, D]
-
+        # 2. 智能体（A）的位置嵌入：区分不同的智能体（如“行人1”和“行人2”）
         a_pe = self.agent_order_embedding(torch.arange(A, device=device))  # [A, D]
         a_pe_batch = repeat(a_pe, 'a d -> b k a d', b=B, k=K)	# [B, K, A, D]
 
-
+        # 将位置嵌入添加到噪声特征中
         y_emb = y_emb + k_pe_batch + a_pe_batch
-        y_emb_k = rearrange(y_emb, 'b k a d -> (b a) k d')
+        y_emb_k = rearrange(y_emb, 'b k a d -> (b a) k d')        #[2560,20,1,28]
         y_emb_k = self.noisy_y_attn_k(y_emb_k)
         y_emb = rearrange(y_emb_k, '(b a) k d -> b k a d', b=B, a=A)
 
-        y_emb_a = rearrange(y_emb, 'b k a d -> (b k) a d')
+        y_emb_a = rearrange(y_emb, 'b k a d -> (b k) a d')         #[2560,20,1,28]
         y_emb_a = self.noisy_y_attn_a(y_emb_a)
         y_emb = rearrange(y_emb_a, '(b k) a d -> b k a d', b=B, k=K)
 
+        #动态丢弃特征模拟噪声，迫使模型学习更稳定的特征表示。
         if self.training and self.config.get('drop_method', None) == 'emb':
             assert self.config.get('drop_logi_k', None) is not None and self.config.get('drop_logi_m', None) is not None
             m, k = self.config.drop_logi_m, self.config.drop_logi_k
@@ -132,16 +148,20 @@ class ETHMotionTransformer(nn.Module):
             y_emb = y_emb.masked_fill(torch.rand_like(p_m) < p_m, 0.)
 
 
-        ### send to motion decoder
+        # send to motion decoder # ... 前面是编码特征准备，此处从解码开始 ...  # 步骤1：融合编码特征、噪声特征、时间特征→[B, K, A, 128]
         emb_fusion = self.init_emb_fusion_mlp(torch.cat((encoder_out_batch, y_emb, t_emb_batch), dim=-1))	 	# [B, K, A, D]
+        # 步骤2：位置编码融合→增强候选/智能体位置信息→[B, K, A, 128] emb_fusion = self.init_emb_fusion_mlp(torch.cat((y_emb, t_emb_batch), dim=-1))	 	# [B, K, A, D]
         query_token = self.post_pe_cat_mlp(emb_fusion + k_pe_batch + a_pe_batch) 								# [B, K, A, D]
-        readout_token = self.motion_decoder(query_token, t_emb)													# [B, K, A, D]	
+        # 步骤3：Motion-Mambaformer 解码（论文核心）
+        readout_token = self.motion_decoder(query_token, t_emb)													# [B, K, A, D]
 
-        ### readout layers
-        denoiser_x = self.reg_head(readout_token)  										# [B, K, A, F * D]
-        denoiser_cls = self.cls_head(readout_token).squeeze(-1) 						# [B, K, A]
+        # 步骤4：生成轨迹坐标（reg_head）和置信度（cls_head）
+        denoiser_x = self.reg_head(readout_token)  										# [B, K, A, 24] → 24=12帧×2维（x,y）
+        denoiser_cls = self.cls_head(readout_token).squeeze(-1) 						# [B, K, A] → 候选轨迹置信度
+        pred_vel = predict_vel_from_data(denoiser_x, y, time) # y = x1 t + x0 (1-t) # 步骤5：预测速度场（适配 Flow Matching 均值流）
+        return [denoiser_x, denoiser_cls, pred_vel]
+        # return pred_vel
 
-        return denoiser_x, denoiser_cls
 
 
 class ETHIMLETransformer(nn.Module):
@@ -254,3 +274,18 @@ class ETHIMLETransformer(nn.Module):
         denoiser_x = self.reg_head(readout_token)  													# [B, K, A, F * D]
 
         return denoiser_x
+
+def pad_t_like_x(t, x):
+    if isinstance(t, (float, int)):
+        return t
+    return t.reshape(-1, *([1] * (x.dim() - 1)))
+
+def predict_vel_from_data(x1, xt, t):
+    """
+
+    Predict the velocity field from the predicted data.
+    """
+    t = pad_t_like_x(t, x1)
+    # v = (x1 - xt) / (1 - t)
+    v = (x1 - xt) / (0 - t)
+    return v

@@ -10,6 +10,8 @@ agents                       : 1
 
 checkpt_freq                 : 10
 
+rotate_aug : False
+
 # -------------------- Flow matching config -----------------------------
 denoising_method             : 'fm'
 sampling_steps               : 10
@@ -23,7 +25,7 @@ notes                        : 'Flow Matching'
 
 # ---------------------------- Configurations for model ----------------------------
 MODEL:
-    NUM_PROPOSED_QUERY: 20
+    NUM_PROPOSED_QUERY: 20 # 20 50
     MODEL_OUT_DIM: 24
     REGRESSION_MLPS: [128, 256, 24]
     CLASSIFICATION_MLPS: [128, 128, 1]
@@ -49,15 +51,15 @@ MODEL:
         DROPOUT_OF_ATTN: 0.1
 
 
-denoising_head_preds         : 20
-k_preds                      : 20
+denoising_head_preds         : 20 # 20
+k_preds                      : 20 # 20
 
 # ------------------------------- Optimizer Parameters ---------------------------------
 train_batch_size             : 128
 test_batch_size              : 1024
 
 OPTIMIZATION:
-    NUM_EPOCHS: 150
+    NUM_EPOCHS: 300 # 150
 
     OPTIMIZER: AdamW
     LR: 0.0001

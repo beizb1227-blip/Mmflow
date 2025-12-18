@@ -109,41 +109,43 @@ Our teacher MoFlow model and student IMLE model share almost the same architectu
 
 For each dataset, we need to train our MoFlow teacher model first:
 
-1. **Teacher Model Training**
+1. **Teacher Model Training** 训练
 ```bash
 ### NBA dataset
 python fm_nba.py --exp <exp_name> --tied_noise --fm_in_scaling --checkpt_freq 5 --batch_size 192 --init_lr 1e-3
 
 ### ETH dataset
-python3 fm_eth.py --exp <exp_name> --rotate --data_source LED --rotate_time_frame 6 --subset eth --tied_noise --fm_in_scaling --checkpt_freq 1 --batch_size 32 --init_lr 1e-4 
-python3 fm_eth.py --exp <exp_name> --rotate --data_source LED --rotate_time_frame 6 --subset hotel --tied_noise --fm_in_scaling --checkpt_freq 1 --batch_size 48 --init_lr 1e-4 
-python3 fm_eth.py --exp <exp_name> --rotate --data_source LED --rotate_time_frame 6 --subset univ --tied_noise --fm_in_scaling --checkpt_freq 1 --batch_size 48 --init_lr 1e-4 
-python3 fm_eth.py --exp <exp_name> --rotate --data_source LED --rotate_time_frame 6 --subset zara1 --tied_noise --fm_in_scaling --checkpt_freq 1 --batch_size 32 --init_lr 1e-4 
-python3 fm_eth.py --exp <exp_name> --rotate --data_source LED --rotate_time_frame 6 --subset zara2 --tied_noise --fm_in_scaling --checkpt_freq 1 --batch_size 32 --init_lr 1e-4 
+python3 fm_eth.py --exp 5-26-eth --rotate --data_source LED --rotate_time_frame 6 --subset eth --tied_noise --fm_in_scaling --checkpt_freq 1 --batch_size 128 --init_lr 1e-4 
+python3 fm_eth.py --exp 6-11-hotel --rotate --data_source LED --rotate_time_frame 6 --subset hotel --tied_noise --fm_in_scaling --checkpt_freq 1 --batch_size 128 --init_lr 1e-4 
+python3 fm_eth.py --exp 6-19-univ --rotate --data_source LED --rotate_time_frame 6 --subset univ --tied_noise --fm_in_scaling --checkpt_freq 1 --batch_size 128 --init_lr 1e-4 
+python3 fm_eth.py --exp 5-18-zara1 --rotate --data_source LED --rotate_time_frame 6 --subset zara1 --tied_noise --fm_in_scaling --checkpt_freq 1 --batch_size 128 --init_lr 1e-4 
+python3 fm_eth.py --exp 6-11-zara2 --rotate --data_source LED --rotate_time_frame 6 --subset zara2 --tied_noise --fm_in_scaling --checkpt_freq 1 --batch_size 128 --init_lr 1e-4 
 
 ### SDD dataset
-python fm_sdd.py --exp <exp_name> --rotate --rotate_time_frame 6 --tied_noise --fm_in_scaling --checkpt_freq 1 --batch_size 48 --init_lr 1e-4 --perturb_ctx 0.03
+python fm_sdd.py --exp 7-6 --rotate --rotate_time_frame 6 --tied_noise --fm_in_scaling --checkpt_freq 1 --batch_size 128 --init_lr 1e-4 --perturb_ctx 0.03
+
 ```
 
-2. **Teacher Model Sampling**
+2. **Teacher Model Sampling** 采样
 ```bash
+
 ### NBA dataset
-python3 eval_nba.py --ckpt_path <path_to_nba_teacher_checkpoint> \
---batch_size 1000 --sampling_steps 100 --solver lin_poly --lin_poly_p 5 --lin_poly_long_step 1000 --save_samples --eval_on_train
+python3 eval_nba.py --ckpt_path  \
+--batch_size 1 --sampling_steps 100 --solver lin_poly --lin_poly_p 5 --lin_poly_long_step 1000 --save_samples --eval_on_train
 
 ### ETH dataset
 python3 eval_eth.py \
---ckpt_path <path_to_eth_teacher_checkpoint> \
+--ckpt_path results_eth_ucy/cor_fm/5-26-eth/models/checkpoint_best.pt \
 --subset eth --rotate --rotate_time_frame 6 \
---batch_size 1000 --sampling_steps 100 --solver lin_poly --lin_poly_p 5 --lin_poly_long_step 1000 --save_samples --eval_on_train
+--batch_size 256 --sampling_steps 100 --solver lin_poly --lin_poly_p 5 --lin_poly_long_step 1000 --save_samples --eval_on_train
 
 python3 eval_eth.py \
---ckpt_path <path_to_hotel_teacher_checkpoint> \
+--ckpt_path results_eth_ucy/cor_fm/6-11-hotel/models/checkpoint_best.pt \
 --subset hotel --rotate --rotate_time_frame 6 \
---batch_size 1000 --sampling_steps 100 --solver lin_poly --lin_poly_p 5 --lin_poly_long_step 1000 --save_samples --eval_on_train
+--batch_size 128 --sampling_steps 100 --solver lin_poly --lin_poly_p 5 --lin_poly_long_step 1000 --save_samples --eval_on_train
 
 python3 eval_eth.py \
---ckpt_path <path_to_univ_teacher_checkpoint> \
+--ckpt_path results_eth_ucy/cor_fm/6-19-univ/models/checkpoint_best.pt \
 --subset univ --rotate --rotate_time_frame 6 \
 --batch_size 1000 --sampling_steps 100 --solver lin_poly --lin_poly_p 5 --lin_poly_long_step 1000 --save_samples --eval_on_train
 
@@ -153,13 +155,14 @@ python3 eval_eth.py \
 --batch_size 1000 --sampling_steps 100 --solver lin_poly --lin_poly_p 5 --lin_poly_long_step 1000 --save_samples --eval_on_train
 
 python3 eval_eth.py \
---ckpt_path <path_to_zara2_teacher_checkpoint> \
+--ckpt_path results_eth_ucy/cor_fm/6-11-zara2/models/checkpoint_best.pt \
 --subset zara2 --rotate --rotate_time_frame 6 \
---batch_size 1000 --sampling_steps 100 --solver lin_poly --lin_poly_p 5 --lin_poly_long_step 1000 --save_samples --eval_on_train
+--batch_size 128 --sampling_steps 100 --solver lin_poly --lin_poly_p 5 --lin_poly_long_step 1000 --save_samples --eval_on_train
 
 ### SDD dataset
-python eval_sdd.py --ckpt_path <path_to_sdd_teacher_checkpoint> \
---rotate --rotate_time_frame 6 --batch_size 1000 --sampling_steps 100 --solver lin_poly --lin_poly_p 5 --lin_poly_long_step 1000 --save_samples --eval_on_train
+python eval_sdd.py --ckpt_path results_sdd/cor_fm/7-6/models/checkpoint_best.pt \
+--rotate --rotate_time_frame 6 --batch_size 1 --sampling_steps 100 --solver lin_poly --lin_poly_p 5 --lin_poly_long_step 1000 --save_samples --eval_on_train
+
 ```
 
 

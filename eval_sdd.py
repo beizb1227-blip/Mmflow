@@ -25,14 +25,14 @@ def parse_config():
 	parser = argparse.ArgumentParser()
 
 	# Basic configuration
-	parser.add_argument('--ckpt_path', type=str, default=None, help='Path to the checkpoint to load the model from.')
-	parser.add_argument('--cfg', default='auto', type=str, help="Config file path")
+	parser.add_argument('--ckpt_path', type=str, default='results_sdd/cor_fm/_FM_S10_log_m-0.5_s1.5_dire_PC_0.00_drop_emb_m0.5_k20.0_NN_A_REG_S_min_max_LR0.0001_WD0.01_CLS_1.0_BS128_EP300/models/checkpoint_best.pt', help='Path to the checkpoint to load the model from.')
+	parser.add_argument('--cfg', default='results_sdd/cor_fm/_FM_S10_log_m-0.5_s1.5_dire_PC_0.00_drop_emb_m0.5_k20.0_NN_A_REG_S_min_max_LR0.0001_WD0.01_CLS_1.0_BS128_EP300/cor_fm_updated.yml', type=str, help="Config file path")
 	parser.add_argument('--exp', default='', type=str, help='Experiment description for each run, name of the saving folder.')
 	parser.add_argument('--save_samples', default=False, action='store_true', help='Save the samples during evaluation.')
 	parser.add_argument('--eval_on_train', default=False, action='store_true', help='Evaluate the model on the training set.')
 
 	# Data configuration
-	parser.add_argument('--batch_size', default=None, type=int, help='Override the batch size in the config file.')
+	parser.add_argument('--batch_size', default=1, type=int, help='Override the batch size in the config file.')
 	parser.add_argument('--data_dir', type=str, default='./data/sdd', help='Directory where the data is stored.')
 	parser.add_argument('--n_train', type=int, default=32500, help='Number training scenes used.')
 	parser.add_argument('--n_test', type=int, default=12500, help='Number testing scenes used.')

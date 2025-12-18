@@ -10,13 +10,15 @@ from utils.normalization import normalize_min_max
 
 
 def seq_collate_eth(batch):
-    (index, past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel) = zip(*batch)
+    # (index, past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel) = zip(*batch)
+    (index, past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, initial_pos) = zip(*batch)
     indexes = torch.stack(index, dim=0)
     pre_motion_3D = torch.stack(past_traj,dim=0)
     fut_motion_3D = torch.stack(fut_traj,dim=0)
     pre_motion_3D_orig = torch.stack(past_traj_orig, dim=0)
     fut_motion_3D_orig = torch.stack(fut_traj_orig, dim=0)
     fut_traj_vel = torch.stack(traj_vel, dim=0)
+    initial_pos = torch.stack(initial_pos, dim=0)
 
     batch_size = torch.tensor(pre_motion_3D.shape[0]) ### bt 
     data = {
@@ -26,7 +28,8 @@ def seq_collate_eth(batch):
         'fut_traj': fut_motion_3D,
         'past_traj_original_scale': pre_motion_3D_orig,
         'fut_traj_original_scale': fut_motion_3D_orig,
-        'fut_traj_vel': fut_traj_vel,  
+        'fut_traj_vel': fut_traj_vel,
+        'initial_pos': initial_pos,
     }
 
     return data 
@@ -90,7 +93,7 @@ def rotate_traj(past_rel, future_rel, past_abs, agents=2, rotate_time_frame=0, s
 
 
 class ETHDataset(object):
-    def __init__(self, cfg, training=True, data_dir = None, subset = None, rotate_time_frame=0, imle=False, type='original'):
+    def __init__(self, cfg, training=True, data_dir = None, subset = None, rotate_time_frame=0, imle=False, type='LED'):
         ### LED version of preprocessed data
         if type == 'LED':
             data_file_path = os.path.join(data_dir, type, '{:s}_data_{:s}.npy'.format(subset, 'train' if training else 'test'))
@@ -122,13 +125,14 @@ class ETHDataset(object):
         
         ### compute past and future trajectories
         past_traj_abs = self.all_data[:,:,:cfg.past_frames]
-        initial_pos = past_traj_abs[:, :, -1:]
-        past_traj_rel = (past_traj_abs - initial_pos).contiguous()
+        initial_pos = past_traj_abs[:, :, -1:] # 观测最后一帧
+        self.initial_pos = initial_pos
+        past_traj_rel = (past_traj_abs - initial_pos).contiguous() # 相对位置
         fut_traj = (self.all_data[:,:,cfg.past_frames:] - initial_pos).contiguous()
         if cfg.rotate:
             past_traj_rel, fut_traj, past_traj_abs = rotate_traj(past_traj_rel, fut_traj, past_traj_abs, cfg.agents, rotate_time_frame, subset)
-        past_traj_vel = torch.cat((past_traj_rel[:, :, 1:] - past_traj_rel[:, :, :-1], torch.zeros_like(past_traj_rel[:,:, -1:])), dim=2)
-        past_traj = torch.cat((past_traj_abs, past_traj_rel, past_traj_vel), dim=-1)
+        past_traj_vel = torch.cat((past_traj_rel[:, :, 1:] - past_traj_rel[:, :, :-1], torch.zeros_like(past_traj_rel[:,:, -1:])), dim=2) # 速度分量
+        past_traj = torch.cat((past_traj_abs, past_traj_rel, past_traj_vel), dim=-1) # 绝对位置，相对位置，速度分量
         self.fut_traj_vel = torch.cat((fut_traj[:, :, 1:] - fut_traj[:,:, :-1], torch.zeros_like(fut_traj[:, :, -1:])), dim=2)
 
         self.rotate_aug = cfg.rotate_aug and training
@@ -143,7 +147,7 @@ class ETHDataset(object):
         self.past_traj_original_scale = past_traj
         self.fut_traj_original_scale = fut_traj
    
-        ### min-max linear normalization
+        ### min-max linear normalization  # 最大最小值归一化
         if cfg.data_norm == 'min_max':
             self.past_traj = normalize_min_max(past_traj, cfg.past_traj_min, cfg.past_traj_max, -1, 1).contiguous()
             self.fut_traj = normalize_min_max(fut_traj, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1).contiguous()
@@ -215,7 +219,8 @@ class ETHDataset(object):
             fut_traj_norm_scale = self.fut_traj[item]                               # [A, F, 2] 
             past_traj_original_scale = self.past_traj_original_scale[item]          # [A, P, 6]
             fut_traj_original_scale = self.fut_traj_original_scale[item]            # [A, F, 2]
-            fut_traj_vel = self.fut_traj_vel[item]                                  # [A, F, 2]   
+            fut_traj_vel = self.fut_traj_vel[item]                                  # [A, F, 2]
+            initial_pos = self.initial_pos[item]
 
             if self.rotate_aug:
                 A = past_traj_norm_scale.size(0)
@@ -251,7 +256,8 @@ class ETHDataset(object):
                 fut_traj_norm_scale,
                 past_traj_original_scale,
                 fut_traj_original_scale, 
-                fut_traj_vel
+                fut_traj_vel,
+                initial_pos
             ]
         return out
 
@@ -312,7 +318,7 @@ class ETHDatasetSocialGAN:
                         _idx = num_peds_considered
                         curr_seq[_idx, :, pad_front:pad_end] = curr_ped_seq
                         num_peds_considered += 1
-                    if num_peds_considered > min_ped:
+                    if num_peds_considered > min_ped:     # 场景中必须要大于一个行人
                         num_peds_in_seq.append(num_peds_considered)
                         seq_list.append(curr_seq[:num_peds_considered])
                         frame_list.append(frames[idx])
